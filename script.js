@@ -162,7 +162,11 @@ document.addEventListener('DOMContentLoaded', function() {
     });
     
     // 导出音频
-    exportBtn.addEventListener('click', function() {
+    exportBtn.addEventListener('click', async function() {
+        if (synth.speaking) {
+            showStatusMessage('请等待当前朗读结束后再导出。', 'info');
+            return;
+        }
         if (!storyText.value.trim()) {
             showStatusMessage('请输入要转换的文本', 'error');
             return;
@@ -177,91 +181,204 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         lastSelectedVoiceName = selectedVoiceName;
         
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const destination = audioContext.createMediaStreamDestination();
-        mediaRecorder = new MediaRecorder(destination.stream);
-        audioChunks = [];
-        
-        mediaRecorder.start();
-        showStatusMessage('正在生成音频...', 'info');
-        exportBtn.classList.add('processing');
-        
-        mediaRecorder.ondataavailable = function(event) {
-            audioChunks.push(event.data);
-        };
-        
-        mediaRecorder.onstop = function() {
-            const audioBlob = new Blob(audioChunks, { type: exportFormat.value });
-            const audioUrl = URL.createObjectURL(audioBlob);
+        let capturedStream = null; // To store the captured stream
+
+        try {
+            showStatusMessage('请在弹窗中选择"此标签页"或包含此应用的窗口，并确保勾选"共享音频"。', 'info');
             
-            audioPreview.src = audioUrl;
-            audioPreviewContainer.classList.remove('hidden');
-            audioPreviewContainer.classList.add('show');
+            // Request permission to capture tab audio
+            capturedStream = await navigator.mediaDevices.getDisplayMedia({
+                video: true, // Video is often required, even if not used, to get audio reliably
+                audio: {
+                    // These constraints help ensure we get system/tab audio
+                    // Suppress local audio playback to avoid echo if mic was also captured (though we ask for no mic)
+                    suppressLocalAudioPlayback: true 
+                },
+                preferCurrentTab: true, // Hint to prefer the current tab
+            });
+
+            if (!capturedStream.getAudioTracks() || capturedStream.getAudioTracks().length === 0) {
+                showStatusMessage('未能捕获到音频。请确保在分享时已勾选音频共享选项。', 'error');
+                if (capturedStream) {
+                    capturedStream.getTracks().forEach(track => track.stop());
+                }
+                return;
+            }
             
-            const a = document.createElement('a');
-            a.href = audioUrl;
-            const fileName = storyTitle.value ? `${storyTitle.value}.${exportFormat.value.split('/')[1]}` : 
-                             `story_voice_${new Date().toISOString().slice(0, 10)}.${exportFormat.value.split('/')[1]}`;
-            a.download = fileName;
-            a.click();
+            audioChunks = []; // Reset audio chunks
             
-            showStatusMessage('音频导出成功!', 'success');
+            let chosenMimeType = exportFormat.value;
+            let initialChoice = exportFormat.value; // Store the user's initial selection
+            let finalFileExtension = chosenMimeType.split('/')[1] === 'mpeg' ? 'mp3' : chosenMimeType.split('/')[1];
+
+            // Fallback logic based on initial choice
+            if (initialChoice === 'audio/mpeg') {
+                if (!MediaRecorder.isTypeSupported(initialChoice)) {
+                    showStatusMessage(`浏览器不支持导出 MP3 格式。正在尝试 WAV 格式...`, 'info');
+                    console.warn('audio/mpeg is not supported. Trying audio/wav');
+                    chosenMimeType = 'audio/wav';
+                    finalFileExtension = 'wav';
+                    if (!MediaRecorder.isTypeSupported(chosenMimeType)) {
+                        showStatusMessage('浏览器也不支持 WAV 格式。正在尝试 WebM 格式...', 'info');
+                        console.warn('audio/wav is not supported. Trying audio/webm');
+                        chosenMimeType = 'audio/webm';
+                        finalFileExtension = 'webm';
+                        if (!MediaRecorder.isTypeSupported(chosenMimeType)) {
+                            console.error('audio/webm is not supported either. Cannot record.');
+                            showStatusMessage('抱歉，您的浏览器不支持任何可用的录音格式 (MP3, WAV, WebM)。', 'error');
+                            if (capturedStream) { capturedStream.getTracks().forEach(track => track.stop()); }
+                            return;
+                        } else {
+                            console.info('Fell back to audio/webm after MP3 and WAV failed isTypeSupported.');
+                        }
+                    } else {
+                        console.info('Fell back to audio/wav after MP3 failed isTypeSupported.');
+                    }
+                } else {
+                    // MP3 is directly supported
+                    console.info('audio/mpeg is directly supported.');
+                }
+            } else if (initialChoice === 'audio/wav') {
+                if (!MediaRecorder.isTypeSupported(initialChoice)) {
+                    showStatusMessage(`浏览器不支持导出 WAV 格式。正在尝试 WebM 格式...`, 'info');
+                    console.warn('audio/wav is not supported. Trying audio/webm');
+                    chosenMimeType = 'audio/webm';
+                    finalFileExtension = 'webm';
+                    if (!MediaRecorder.isTypeSupported(chosenMimeType)) {
+                        console.error('audio/webm is not supported either. Cannot record.');
+                        showStatusMessage('抱歉，您的浏览器不支持任何可用的录音格式 (WAV, WebM)。', 'error');
+                        if (capturedStream) { capturedStream.getTracks().forEach(track => track.stop()); }
+                        return;
+                    } else {
+                        console.info('Fell back to audio/webm after WAV failed isTypeSupported.');
+                    }
+                } else {
+                     // WAV is directly supported
+                    console.info('audio/wav is directly supported.');
+                }
+            } // Add other initial choices if any in future
+
+            showStatusMessage(`将以 ${finalFileExtension.toUpperCase()} 格式导出。`, 'info');
+
+            try {
+                console.log("Attempting mediaRecorder.start() with effective mimeType:", mediaRecorder.mimeType || "browser default (if init with no mimeType)"); 
+                mediaRecorder.start();
+                console.log("mediaRecorder.start() was called successfully (or did not throw an immediate synchronous error).");
+            } catch (startError) {
+                console.error("!!!!!!!!!! START ERROR CAUGHT (with chosenMimeType: '" + mediaRecorder.mimeType + "') !!!!!!!!!!!");
+                console.error("Error Name:", startError.name);
+                console.error("Error Message:", startError.message);
+                console.error("Full Error Object:", startError);
+                
+                // LAST DITCH ATTEMPT: Try re-initializing MediaRecorder with no specified MIME type
+                console.warn("Attempting last-ditch effort: Re-initialize MediaRecorder with NO MIME type (browser default).");
+                showStatusMessage(`录制启动失败 (${mediaRecorder.mimeType}). 尝试浏览器默认配置...`, 'info');
+                try {
+                    if (!capturedStream.active) {
+                        throw new Error("Stream became inactive before last-ditch attempt.");
+                    }
+                    mediaRecorder = new MediaRecorder(capturedStream); // Let browser pick its default
+                    finalFileExtension = 'webm'; // Assume webm for browser default, user can rename if needed
+                    console.log("Successfully re-initialized MediaRecorder with browser default. Attempting start() again.");
+                    mediaRecorder.start(); // Try starting again with browser default
+                    console.log("Successfully started MediaRecorder with browser default after initial start failed.");
+                    // If this succeeds, the ondataavailable and onstop from the *outer* mediaRecorder instance will handle it.
+                    // We need to ensure the original ondataavailable and onstop are still wired up if we re-assign mediaRecorder here.
+                    // For simplicity in this last ditch, we'll assume the original handlers are okay.
+                    // However, this means the original mediaRecorder.ondataavailable etc. need to be set up *after* all this init logic.
+                    // This is getting complicated. Let's simplify the handler re-attachment for this specific last ditch effort.
+
+                    // Re-attach handlers to the new mediaRecorder instance for this last ditch effort
+                    mediaRecorder.ondataavailable = function(event) {
+                        if (event.data.size > 0) {
+                            audioChunks.push(event.data);
+                        }
+                    };
+                    mediaRecorder.onstop = function() {
+                        if (audioChunks.length === 0) {
+                            showStatusMessage('录制失败 (默认配置)，没有捕获到音频数据。请重试。', 'error');
+                        } else {
+                            const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' }); // Use actual mimeType if available
+                            const audioUrl = URL.createObjectURL(audioBlob);
+                            audioPreview.src = audioUrl;
+                            audioPreviewContainer.classList.remove('hidden');
+                            audioPreviewContainer.classList.add('show');
+                            const a = document.createElement('a');
+                            a.href = audioUrl;
+                            const fileName = storyTitle.value ? `${storyTitle.value}.${finalFileExtension}` :
+                                `story_voice_${new Date().toISOString().slice(0, 10)}.${finalFileExtension}`;
+                            a.download = fileName;
+                            a.click();
+                            URL.revokeObjectURL(audioUrl);
+                            showStatusMessage('音频使用浏览器默认配置导出成功!', 'success');
+                        }
+                        exportBtn.classList.remove('processing');
+                        exportBtn.disabled = false;
+                        if (capturedStream) {
+                            capturedStream.getTracks().forEach(track => track.stop());
+                        }
+                    };
+                    // The original utterance.onend and onerror will trigger this new mediaRecorder.stop()
+                    // because the 'utterance' object itself is not re-created.
+
+                } catch (lastDitchError) {
+                    console.error("!!!!!!!!!! LAST DITCH START ERROR CAUGHT !!!!!!!!!!!");
+                    console.error("Last Ditch Error Name:", lastDitchError.name);
+                    console.error("Last Ditch Error Message:", lastDitchError.message);
+                    console.error("Last Ditch Full Error Object:", lastDitchError);
+                    showStatusMessage(`彻底无法启动录制: ${lastDitchError.message}`, 'error');
+                    if (capturedStream) {
+                        capturedStream.getTracks().forEach(track => track.stop());
+                    }
+                    exportBtn.classList.remove('processing');
+                    exportBtn.disabled = false;
+                    return; 
+                }
+            }
+            
+            showStatusMessage('正在录制音频...请勿切换标签页。', 'info');
+            exportBtn.classList.add('processing');
+            exportBtn.disabled = true; // Disable button while recording
+
+            utterance = new SpeechSynthesisUtterance();
+            utterance.text = storyTitle.value ? `${storyTitle.value}。${storyText.value}` : storyText.value;
+            utterance.rate = parseFloat(rateRange.value);
+            
+            const voice = voices.find(v => v.name === selectedVoiceName);
+            if (voice) utterance.voice = voice;
+            
+            utterance.onend = function() {
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop(); 
+                }
+                // synth.speaking will be false here
+                // Tracks are stopped in mediaRecorder.onstop
+            };
+            
+            utterance.onerror = function(event) {
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop();
+                }
+                showStatusMessage('语音合成或录制出错: ' + event.error, 'error');
+                exportBtn.classList.remove('processing');
+                exportBtn.disabled = false;
+                if (capturedStream) {
+                    capturedStream.getTracks().forEach(track => track.stop());
+                }
+            };
+            
+            synth.speak(utterance);
+
+        } catch (error) {
+            console.error("Error during audio export:", error);
+            showStatusMessage(`导出音频失败: ${error.message}. 请确保已授予屏幕录制权限并选择了正确的标签页/窗口和音频共享。`, 'error');
             exportBtn.classList.remove('processing');
-        };
-        
-        utterance = new SpeechSynthesisUtterance();
-        utterance.text = storyTitle.value ? `${storyTitle.value}。${storyText.value}` : storyText.value;
-        utterance.rate = parseFloat(rateRange.value);
-        
-        const voice = voices.find(v => v.name === selectedVoiceName);
-        if (voice) utterance.voice = voice;
-        
-        const utteranceNode = new SpeechSynthesisUtteranceNode(audioContext, utterance);
-        utteranceNode.connect(destination);
-        
-        utterance.onend = function() {
-            mediaRecorder.stop();
-        };
-        
-        utterance.onerror = function(event) {
-            mediaRecorder.stop();
-            showStatusMessage('生成音频出错: ' + event.error, 'error');
-            exportBtn.classList.remove('processing');
-        };
-        
-        synth.speak(utterance);
+            exportBtn.disabled = false;
+            if (capturedStream) {
+                capturedStream.getTracks().forEach(track => track.stop());
+            }
+        }
     });
-    
-    // 自定义SpeechSynthesisUtterance节点
-    function SpeechSynthesisUtteranceNode(audioContext, utterance) {
-        const oscillator = audioContext.createOscillator();
-        const gainNode = audioContext.createGain();
-        
-        oscillator.type = 'sine';
-        oscillator.frequency.value = 0;
-        gainNode.gain.value = 0;
-        
-        oscillator.connect(gainNode);
-        gainNode.connect(audioContext.destination);
-        
-        oscillator.start();
-        
-        // 模拟语音合成
-        utterance.onboundary = function(event) {
-            if (event.name === 'word') {
-                gainNode.gain.value = 1;
-                setTimeout(() => {
-                    gainNode.gain.value = 0;
-                }, 100);
-            }
-        };
-        
-        return {
-            connect: function(destination) {
-                gainNode.connect(destination);
-            }
-        };
-    }
     
     // 显示状态消息
     function showStatusMessage(message, type) {
@@ -277,15 +394,32 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 字数统计
     storyText.addEventListener('input', function() {
-        const wordCount = storyText.value.length;
-        const countElement = document.createElement('div');
-        countElement.className = 'word-count';
-        countElement.textContent = `${wordCount} 字`;
-        
-        if (!document.querySelector('.word-count')) {
-            storyText.parentNode.appendChild(countElement);
+        // Calculate word count based on Chinese characters or English words
+        const text = storyText.value;
+        let wordCount = 0;
+        if (text.match(/[\u4e00-\u9fa5]/)) { // Check if text contains Chinese characters
+            wordCount = text.length; // For Chinese, count characters
         } else {
-            document.querySelector('.word-count').textContent = `${wordCount} 字`;
+            const words = text.match(/\b\w+\b/g); // For English, count words
+            wordCount = words ? words.length : 0;
+        }
+
+        const countElement = document.querySelector('.word-count');
+        const labelElement = storyText.previousElementSibling; // Get the label "雅思口语范例"
+        
+        if (countElement) {
+            countElement.textContent = `${wordCount} ${text.match(/[\u4e00-\u9fa5]/) ? '字' : 'words'}`;
+        } else {
+            const newCountElement = document.createElement('div');
+            newCountElement.className = 'word-count';
+            newCountElement.textContent = `${wordCount} ${text.match(/[\u4e00-\u9fa5]/) ? '字' : 'words'}`;
+            // Insert the count element after the textarea, but ideally aligned with its label or in a consistent place
+            // For simplicity, placing after textarea. Better structure would be a dedicated div for label + count
+            if (labelElement && labelElement.parentNode) {
+                 labelElement.parentNode.insertBefore(newCountElement, storyText.nextSibling);
+            } else {
+                storyText.parentNode.appendChild(newCountElement);
+            }
         }
     });
 
